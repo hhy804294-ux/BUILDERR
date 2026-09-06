@@ -1,0 +1,224 @@
+name: Build Flutter APK / AAB
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project (alias: source_url)"
+        required: false
+        default: ""
+      source_url:
+        description: "URL download ZIP project (preferensi baru)"
+        required: false
+        default: ""
+      tag:
+        description: "Tag build (opsional, auto-generate jika kosong)"
+        required: false
+        default: ""
+      build_id:
+        description: "Build ID dari bot (opsional)"
+        required: false
+        default: ""
+      build_type:
+        description: "release | debug | apk | aab | both"
+        required: true
+        default: "release"
+      only_analyze:
+        description: "Hanya jalankan analyze (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Resolve inputs
+        id: meta
+        run: |
+          ZIP_URL="${{ github.event.inputs.source_url }}"
+          if [ -z "$ZIP_URL" ]; then
+            ZIP_URL="${{ github.event.inputs.zip_url }}"
+          fi
+          if [ -z "$ZIP_URL" ]; then
+            echo "❌ Tidak ada zip_url / source_url"
+            exit 1
+          fi
+          echo "zip_url=$ZIP_URL" >> $GITHUB_OUTPUT
+
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="build-${{ github.run_id }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+          BT="${{ github.event.inputs.build_type }}"
+          # Normalisasi: apk/release/debug → APK, aab → AAB, both → keduanya
+          case "$BT" in
+            aab|appbundle) MODE="aab" ;;
+            both|apk+aab|all) MODE="both" ;;
+            debug) MODE="debug" ;;
+            *) MODE="release" ;;
+          esac
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "Resolved: zip=$ZIP_URL tag=$TAG mode=$MODE"
+
+      - name: Download ZIP project
+        run: |
+          echo "=== Downloading ZIP ==="
+          echo "URL: ${{ steps.meta.outputs.zip_url }}"
+          curl -L --fail --retry 3 --retry-delay 5 \
+            -H "Accept: application/octet-stream" \
+            "${{ steps.meta.outputs.zip_url }}" \
+            -o project.zip \
+            -w "\n=== HTTP Status: %{http_code} ===\n"
+          ls -lh project.zip
+          file project.zip
+
+      - name: Extract ZIP
+        run: |
+          if ! unzip -t project.zip > /dev/null 2>&1; then
+            echo "❌ File bukan ZIP valid!"
+            head -c 500 project.zip || true
+            exit 1
+          fi
+          unzip -q project.zip -d project_raw
+          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          else
+            PROJECT_DIR="project_raw"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "✅ Project dir: $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 2 | head -40
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: "stable"
+          cache: true
+
+      - name: Analyze (optional)
+        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            flutter analyze || true
+          fi
+          echo "Analyze-only mode. Stopping."
+          exit 1
+
+      - name: Flutter Doctor
+        run: flutter doctor -v
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            flutter pub get
+          else
+            echo "Native / non-Flutter project"
+          fi
+
+      - name: Build
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          MODE="${{ steps.meta.outputs.mode }}"
+          echo "=== Building mode: $MODE ==="
+
+          if [ -f "pubspec.yaml" ]; then
+            if [ "$MODE" = "debug" ]; then
+              flutter build apk --debug
+            elif [ "$MODE" = "aab" ]; then
+              flutter build appbundle --release
+            elif [ "$MODE" = "both" ]; then
+              flutter build apk --release
+              flutter build appbundle --release
+            else
+              flutter build apk --release
+            fi
+          else
+            GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
+            if [ -z "$GRADLE_PATH" ]; then
+              echo "❌ gradlew tidak ditemukan"
+              exit 1
+            fi
+            GRADLE_DIR=$(dirname "$GRADLE_PATH")
+            cd "$GRADLE_DIR"
+            chmod +x gradlew
+            if [ "$MODE" = "debug" ]; then
+              ./gradlew assembleDebug
+            elif [ "$MODE" = "aab" ]; then
+              ./gradlew bundleRelease
+            elif [ "$MODE" = "both" ]; then
+              ./gradlew assembleRelease
+              ./gradlew bundleRelease
+            else
+              ./gradlew assembleRelease
+            fi
+            cd -
+          fi
+
+      - name: Collect artifacts
+        id: collect
+        run: |
+          mkdir -p out
+          APK=$(find $GITHUB_WORKSPACE -name "*.apk" -type f | head -n 1 || true)
+          AAB=$(find $GITHUB_WORKSPACE -name "*.aab" -type f | head -n 1 || true)
+
+          if [ -n "$APK" ]; then
+            cp "$APK" out/app.apk
+            echo "has_apk=true" >> $GITHUB_OUTPUT
+            ls -lh out/app.apk
+          else
+            echo "has_apk=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ -n "$AAB" ]; then
+            cp "$AAB" out/app.aab
+            echo "has_aab=true" >> $GITHUB_OUTPUT
+            ls -lh out/app.aab
+          else
+            echo "has_aab=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ ! -f out/app.apk ] && [ ! -f out/app.aab ]; then
+            echo "❌ Tidak ada APK maupun AAB yang dihasilkan"
+            find $GITHUB_WORKSPACE -name "*.apk" -o -name "*.aab" || true
+            exit 1
+          fi
+
+      - name: Upload APK
+        if: steps.collect.outputs.has_apk == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: out/app.apk
+          retention-days: 2
+          if-no-files-found: error
+
+      - name: Upload AAB
+        if: steps.collect.outputs.has_aab == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab
+          path: out/app.aab
+          retention-days: 2
+          if-no-files-found: error
