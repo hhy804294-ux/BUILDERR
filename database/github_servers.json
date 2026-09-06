@@ -1,0 +1,12 @@
+{
+  "_comment": "GitHub server credentials pool. Each entry is one GitHub account used as a build server.",
+  "_format": {
+    "token": "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",
+    "repo": "hhy804294-ux/BUILDERR",
+    "label": "Server 1",
+    "active": true,
+    "currentJobs": 0,
+    "maxJobs": 3
+  },
+  "servers": []
+}
